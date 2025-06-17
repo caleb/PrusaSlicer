@@ -1,24 +1,45 @@
 #!/usr/bin/env ruby
 
+require 'bigdecimal'
 require 'fileutils'
 
-# Parse a value and its unit, returning [numeric_value, unit]
+# Parse a value and its unit, returning [BigDecimal value, unit, is_integer]
 def parse_value(value_str)
   # Match number with optional unit (e.g., "40%", "0.2mm", "100")
-  match = value_str.match(/^(\d*\.?\d+)(%?|mm)?$/)
-  return [match[1].to_f, match[2] || ""] if match
-  raise "Invalid value format: #{value_str}"
+  match = value_str.match(/^(\d*\.?\d*)(%?|mm)?$/)
+  raise "Invalid value format: #{value_str}" unless match
+
+  num_str = match[1]
+  unit = match[2] || ""
+  is_integer = num_str !~ /\./
+  value = BigDecimal(num_str)
+  [value, unit, is_integer]
 end
 
-# Parse a relative adjustment (e.g., "= + 10%", "= - 0.1mm"), returning [operation, amount, unit]
+# Parse a relative adjustment (e.g., "= + 10%", "= - 0.1mm"), returning [operation, BigDecimal amount, unit]
 def parse_relative_value(value_str)
   # Match "= [+|-] number [%|mm]" or "= [+|-] number"
-  match = value_str.match(/^=\s*([+-])\s*(\d*\.?\d+)(%?|mm)?$/)
-  return [match[1], match[2].to_f, match[3] || ""] if match
-  raise "Invalid relative value format: #{value_str}"
+  match = value_str.match(/^=\s*([+-])\s*(\d*\.?\d*)(%?|mm)?$/)
+  raise "Invalid relative value format: #{value_str}" unless match
+
+  op = match[1]
+  amount = BigDecimal(match[2])
+  unit = match[3] || ""
+  [op, amount, unit]
 end
 
-# Preview changes for a single file, returning [old_value, new_value, new_line] or nil if unchanged
+# Format a BigDecimal value based on original integer status
+def format_value(value, unit, original_is_integer)
+  if value.frac == 0 && original_is_integer
+    "#{value.to_i}#{unit}"
+  else
+    # Format with up to 4 decimal places, removing trailing zeros
+    formatted = value.round(4).to_s('F').sub(/\.?0+$/, '')
+    "#{formatted}#{unit}"
+  end
+end
+
+# Preview changes for a single file, returning [old_value, new_value, line_index, new_line] or nil if unchanged
 def preview_change(file_path, property, value)
   begin
     content = File.read(file_path)
@@ -27,6 +48,7 @@ def preview_change(file_path, property, value)
     old_value = nil
     new_value = nil
     new_line = nil
+    insert_index = nil
 
     # Check if property exists and get its current value
     lines.each_with_index do |line, index|
@@ -36,17 +58,12 @@ def preview_change(file_path, property, value)
         if value.start_with?('=')
           # Relative adjustment
           op, amount, rel_unit = parse_relative_value(value)
-          current_value, current_unit = parse_value(old_value)
+          current_value, current_unit, current_is_integer = parse_value(old_value)
           raise "Unit mismatch: expected #{rel_unit}, got #{current_unit}" unless rel_unit == current_unit
 
-          if rel_unit == '%'
-            new_value = op == '+' ? current_value + amount : current_value - amount
-          else
-            new_value = op == '+' ? current_value + amount : current_value - amount
-          end
-          new_value = new_value.round(4) # Avoid floating-point precision issues
-          new_value = [new_value, 0].max if current_unit.empty? && new_value < 0 # Prevent negative for unitless
-          new_value_str = "#{new_value}#{current_unit}"
+          new_value = op == '+' ? current_value + amount : current_value - amount
+          new_value = [new_value, BigDecimal('0')].max if current_unit.empty? && new_value < 0 # Prevent negative for unitless
+          new_value_str = format_value(new_value, current_unit, current_is_integer)
         else
           # Absolute value
           new_value_str = value
@@ -56,12 +73,32 @@ def preview_change(file_path, property, value)
       end
     end
 
-    # If property not found, prepare to append
+    # If property not found, determine insertion point for alphabetical order
     unless found
       old_value = "(not set)"
       new_value = value.start_with?('=') ? "(cannot apply relative change)" : value
-      new_line = "#{property} = #{new_value}\n" unless value.start_with?('=')
-      return [old_value, new_value, lines.length, new_line] unless value.start_with?('=')
+      return nil if value.start_with?('=')
+      new_line = "#{property} = #{new_value}\n"
+
+      # Find all property lines and their keys
+      property_lines = []
+      lines.each_with_index do |line, index|
+        if line.match?(/^\s*(\w+)\s*=/)
+          key = line.split('=', 2)[0].strip
+          property_lines << [key, index]
+        end
+      end
+
+      # Find insertion point
+      insert_index = lines.length
+      property_lines.each do |key, index|
+        if key > property
+          insert_index = index
+          break
+        end
+      end
+
+      return [old_value, new_value, insert_index, new_line]
     end
 
     nil
@@ -79,7 +116,11 @@ def apply_change(file_path, preview_data)
   begin
     lines = File.read(file_path).lines
     if line_index < lines.length
-      lines[line_index] = new_line
+      if lines[line_index].match?(/^\s*#{Regexp.escape(_new_value.split('=')[0].strip)}\s*=/)
+        lines[line_index] = new_line
+      else
+        lines.insert(line_index, new_line)
+      end
     else
       lines << new_line
     end
