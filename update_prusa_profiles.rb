@@ -107,18 +107,20 @@ class IniParser
         end
         new_lines << "[#{header}]\n"
       end
-      # Write comments and non-property lines (excluding stanza headers)
+      # Write only meaningful comments (not blank lines)
       profile[:lines].each do |line|
         clean_line = line.split("#").first.strip
-        # Skip property lines and stanza headers
-        next if clean_line.match?(/^\s*\w+\s*=/) || clean_line.match?(/^\s*\[.*\]\s*$/)
+        # Skip property lines, stanza headers, and blank lines
+        next if clean_line.match?(/^\s*\w+\s*=/) || clean_line.match?(/^\s*\[.*\]\s*$/) || clean_line.empty?
 
-        new_lines << line
+        # Only include lines that have comments
+        new_lines << line if line.include?("#")
       end
-      # Write properties
+      # Write properties (no blank line between header and properties)
       profile[:properties].each do |key, value|
         new_lines << "#{key} = #{value}\n"
       end
+      # Only add blank line after the last property if this isn't the last profile
       new_lines << "\n" unless new_lines.last == "\n"
     end
     File.write(file_path, new_lines.join)
@@ -345,7 +347,7 @@ rescue StandardError => e
   puts "Error in #{File.basename(__FILE__)} at #{location.label} (line ~#{location.lineno}): #{e.message}"
 end
 
-# Find common properties across profiles
+# Find common properties across profiles, excluding properties that should stay in children
 def find_common_properties(profiles)
   return {} if profiles.empty?
 
@@ -353,6 +355,10 @@ def find_common_properties(profiles)
   profiles[1..-1].each do |profile|
     common.keep_if { |k, v| profile[:properties][k] == v }
   end
+
+  # Remove child-only properties from common properties
+  get_child_only_properties.each { |prop| common.delete(prop) }
+
   common.sort.to_h
 end
 
@@ -843,19 +849,21 @@ def write_bundle_file_with_vendor_stanza(bundle_file_path, bundle_profiles, bund
     end
     lines << "[#{header}]\n"
 
-    # Write comments and non-property lines (excluding stanza headers)
+    # Write only meaningful comments (not blank lines)
     profile[:lines].each do |line|
       clean_line = line.split("#").first.strip
-      # Skip property lines and stanza headers
-      next if clean_line.match?(/^\s*\w+\s*=/) || clean_line.match?(/^\s*\[.*\]\s*$/)
+      # Skip property lines, stanza headers, and blank lines
+      next if clean_line.match?(/^\s*\w+\s*=/) || clean_line.match?(/^\s*\[.*\]\s*$/) || clean_line.empty?
 
-      lines << line
+      # Only include lines that have comments
+      lines << line if line.include?("#")
     end
 
-    # Write properties
+    # Write properties (no blank line between header and properties)
     profile[:properties].each do |key, value|
       lines << "#{key} = #{value}\n"
     end
+    # Only add blank line after the last property if this isn't the last profile
     lines << "\n" unless lines.last == "\n"
   end
 
@@ -934,12 +942,16 @@ def clean_profiles(profile_type, custom_profile_dir = nil)
     return false
   end
 
-  # Also check vendor directory for bundled profiles
+  # Check vendor directory for inheritance analysis only (don't modify bundles)
   vendor_dir = File.join(Dir.pwd, "vendor")
 
-  # Load ALL profiles from both directories to build complete inheritance graph
   puts "Loading all #{profile_type} profiles..."
-  all_ini_files = Dir.glob(File.join(profile_dir, "*.ini"))
+
+  # Load target files (files to be cleaned)
+  target_ini_files = Dir.glob(File.join(profile_dir, "*.ini"))
+
+  # Load ALL profiles for inheritance analysis (from both target and vendor directories)
+  all_ini_files = target_ini_files.dup
   all_ini_files += Dir.glob(File.join(vendor_dir, "*.ini")) if Dir.exist?(vendor_dir)
 
   all_profiles = []
@@ -948,11 +960,13 @@ def clean_profiles(profile_type, custom_profile_dir = nil)
     profiles = parser.parse(file)
     all_profiles.concat(profiles)
   end
-  puts "Loaded #{all_profiles.length} total profiles from #{all_ini_files.length} files"
+  puts "Loaded #{all_profiles.length} total profiles from #{all_ini_files.length} files for inheritance analysis"
 
-  # Group profiles by file for processing
+  # Group target profiles by file for processing (only files in target directory)
   files_to_process = {}
-  all_profiles.each do |profile|
+  target_profiles = all_profiles.select { |profile| target_ini_files.include?(profile[:file_path]) }
+
+  target_profiles.each do |profile|
     file_path = profile[:file_path]
     files_to_process[file_path] ||= []
     files_to_process[file_path] << profile
@@ -1223,11 +1237,14 @@ def clean_bundle_file(bundle_name, bundle_dir = nil)
 
     puts "Analyzing #{child_profiles.length} #{profile_type} children for additional common properties..."
 
-    # Find properties that are the same across all children (excluding inherits)
+    # Find properties that are the same across all children (excluding child-only properties)
     additional_common_properties = {}
     if child_profiles.any?
-      # Start with properties from the first child (excluding inherits)
-      first_child_properties = child_profiles.first[:properties].reject { |k, _v| k == "inherits" }
+      # Get list of properties that should never be moved to parent
+      child_only_properties = get_child_only_properties
+
+      # Start with properties from the first child (excluding child-only properties)
+      first_child_properties = child_profiles.first[:properties].reject { |k, _v| child_only_properties.include?(k) }
 
       first_child_properties.each do |property, value|
         # Check if all other children have the exact same value for this property
@@ -1266,6 +1283,77 @@ def clean_bundle_file(bundle_name, bundle_dir = nil)
   total_properties_removed += second_pass_properties_removed
   total_profiles_changed += second_pass_profiles_changed
 
+  # Third phase: Clean external profiles that inherit from bundle profiles
+  puts "\n--- Cleaning external profiles that inherit from bundle profiles ---"
+  external_properties_removed = 0
+  external_profiles_changed = 0
+  external_files_changed = 0
+
+  # Build a list of all profile names from this bundle
+  bundle_profile_names = all_bundle_profiles.map { |p| p[:profile_name] }
+
+  profile_types.each do |profile_type|
+    profile_dir = File.join(Dir.pwd, profile_type)
+    next unless Dir.exist?(profile_dir)
+
+    all_ini_files = Dir.glob(File.join(profile_dir, "*.ini"))
+
+    all_ini_files.each do |file_path|
+      file_parser = IniParser.new(profile_type, File.basename(file_path, ".ini"))
+      file_profiles = file_parser.parse(file_path)
+      file_changed = false
+
+      updated_profiles = file_profiles.map do |profile|
+        # Check if this profile inherits from any profile in the bundle
+        inherits_from_bundle = false
+        if profile[:properties]["inherits"]
+          bundle_profile_names.each do |bundle_profile_name|
+            if profile_inherits_from?(profile, bundle_profile_name)
+              inherits_from_bundle = true
+              break
+            end
+          end
+        end
+
+        if inherits_from_bundle
+          # Clean this profile using all profiles (including bundle profiles)
+          all_profiles_for_cleaning = all_bundle_profiles + all_external_profiles
+
+          original_count = profile[:properties].length
+          cleaned_properties = clean_profile_properties(profile, all_profiles_for_cleaning)
+          new_count = cleaned_properties.length
+
+          properties_removed = original_count - new_count
+          if properties_removed > 0
+            puts "  #{profile[:profile_name]}: removed #{properties_removed} redundant properties"
+            external_properties_removed += properties_removed
+            external_profiles_changed += 1
+            file_changed = true
+          end
+
+          {
+            profile_name: profile[:profile_name],
+            properties: cleaned_properties,
+            comments: profile[:comments],
+            lines: profile[:lines]
+          }
+        else
+          # Keep profile unchanged
+          profile
+        end
+      end
+
+      next unless file_changed
+
+      file_parser.write(file_path, updated_profiles)
+      external_files_changed += 1
+      puts "Cleaned external file: #{File.basename(file_path)}"
+    end
+  end
+
+  total_properties_removed += external_properties_removed
+  total_profiles_changed += external_profiles_changed
+
   if total_properties_removed > 0 || total_profiles_changed > 0
     # Write back the bundle file with vendor stanza preserved
     # We need to determine a primary profile type for the write operation
@@ -1274,6 +1362,7 @@ def clean_bundle_file(bundle_name, bundle_dir = nil)
     puts "\nCleaned #{File.basename(bundle_file_path)}:"
     puts "  - Removed #{total_properties_removed} total redundant properties"
     puts "  - Modified #{total_profiles_changed} profiles"
+    puts "  - Updated #{external_files_changed} external files"
     puts "  - Created/updated inheritance structure within bundle"
   else
     puts "No optimization opportunities found in #{File.basename(bundle_file_path)}"
@@ -1285,6 +1374,18 @@ rescue StandardError => e
   puts "Error cleaning bundle file: #{e.message}"
   puts "Location: #{File.basename(__FILE__)} at #{location.label} (line ~#{location.lineno})"
   false
+end
+
+# Get list of properties that should never be moved to parent profiles
+def get_child_only_properties
+  [
+    "compatible_printers_condition", # Printer/nozzle specific conditions
+    "compatible_printers", # Specific printer lists
+    "filament_vendor",              # Vendor-specific for filament profiles
+    "printer_model",                # Model-specific for printer profiles
+    "nozzle_diameter",              # Nozzle-specific settings
+    "inherits"                      # Inheritance chain should not be moved
+  ]
 end
 
 # Parse command line arguments
@@ -1325,7 +1426,7 @@ def parse_command_line_args
     opts.separator "  clean bundle <name>      Clean specific bundle file"
     opts.separator "  clean <bundle_name>      Clean specific bundle file (shorthand)"
     opts.separator ""
-    opts.separator "Options:"
+    opts.separator "Options (for combine, bundle, update commands only):"
 
     opts.on("--tag TAG", "Filter by tag") do |tag|
       options[:tag] = tag
