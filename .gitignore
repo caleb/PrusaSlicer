@@ -1,3 +1,4 @@
 snapshots
-vendor
+vendor/*
 cache
+!vendor/BigBoy.ini
