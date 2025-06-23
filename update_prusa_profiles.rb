@@ -1200,6 +1200,72 @@ def clean_bundle_file(bundle_name, bundle_dir = nil)
     optimized_profiles.concat(child_profiles)
   end
 
+  # Second pass: look for additional common properties among children that can be moved to parent
+  puts "\n--- Second optimization pass: finding additional common properties ---"
+  second_pass_properties_removed = 0
+  second_pass_profiles_changed = 0
+
+  profile_groups.each do |profile_type, _type_profiles|
+    # Find the parent profile for this type
+    bundle_parent_name = "#{profile_type}: *#{bundle_name}*"
+    parent_profile = optimized_profiles.find { |p| p[:profile_name] == bundle_parent_name }
+
+    next unless parent_profile
+
+    # Get the child profiles for this type (those that inherit from the parent)
+    child_profiles = optimized_profiles.select do |p|
+      p[:profile_name].start_with?("#{profile_type}:") &&
+        p[:profile_name] != bundle_parent_name &&
+        p[:properties]["inherits"] == "*#{bundle_name}*"
+    end
+
+    next if child_profiles.length < 2
+
+    puts "Analyzing #{child_profiles.length} #{profile_type} children for additional common properties..."
+
+    # Find properties that are the same across all children (excluding inherits)
+    additional_common_properties = {}
+    if child_profiles.any?
+      # Start with properties from the first child (excluding inherits)
+      first_child_properties = child_profiles.first[:properties].reject { |k, _v| k == "inherits" }
+
+      first_child_properties.each do |property, value|
+        # Check if all other children have the exact same value for this property
+        additional_common_properties[property] = value if child_profiles.all? { |child| child[:properties][property] == value }
+      end
+    end
+
+    if additional_common_properties.any?
+      puts "Found #{additional_common_properties.length} additional common properties among #{profile_type} children:"
+      additional_common_properties.each { |k, v| puts "  #{k} = #{v}" }
+
+      # Move these properties to the parent
+      additional_common_properties.each do |property, value|
+        parent_profile[:properties][property] = value
+      end
+      parent_profile[:properties] = parent_profile[:properties].sort.to_h
+
+      # Remove these properties from all children
+      child_profiles.each do |child|
+        properties_removed = 0
+        additional_common_properties.each_key do |property|
+          properties_removed += 1 if child[:properties].delete(property)
+        end
+
+        next unless properties_removed > 0
+
+        second_pass_properties_removed += properties_removed
+        second_pass_profiles_changed += 1
+        puts "  #{child[:profile_name]}: moved #{properties_removed} additional properties to parent"
+      end
+    else
+      puts "No additional common properties found among #{profile_type} children"
+    end
+  end
+
+  total_properties_removed += second_pass_properties_removed
+  total_profiles_changed += second_pass_profiles_changed
+
   if total_properties_removed > 0 || total_profiles_changed > 0
     # Write back the bundle file with vendor stanza preserved
     # We need to determine a primary profile type for the write operation
